@@ -13,7 +13,12 @@ const lastProductViewedByEmail = new Map();
 
 function isLoginEvent(body) {
   const lastActivity = body?.customerProperties?.lastActivityType?.toLowerCase?.() || "";
-  return lastActivity.includes("login") || lastActivity.includes("signed in");
+  return lastActivity.includes("login") || lastActivity.includes("signed in") || lastActivity.includes("log in");
+}
+
+function isLogoutEvent(body) {
+  const lastActivity = body?.customerProperties?.lastActivityType?.toLowerCase?.() || "";
+  return lastActivity.includes("logout") || lastActivity.includes("sign out") || lastActivity.includes("signed out") || lastActivity.includes("log out");
 }
 
 function isProductViewEvent(body) {
@@ -145,22 +150,49 @@ async function handleLoginOrCartUpdate(ctx, next) {
 
     const masterdata = ctx?.clients?.masterdata;
 
+    // Normalize cartProperties object to ensure cartProperties exists
+    body.cartProperties = body.cartProperties || {};
+    const incomingItems = Array.isArray(body.cartProperties.items) ? body.cartProperties.items : [];
+
     // 1) Login event
     if (isLoginEvent(body)) {
       console.log(" [CartEvents] Detected login event for", email);
       try {
-        // Pass potential homepage name via productProperties.productName fallback so HubSpot note can show it
-        const loginPage = body?.customerProperties?.lastVisitedPage || body?.customerProperties?.homePage || body?.customerProperties?.landingPage || "";
+        // On login: if cart has items -> Active Cart; if no items -> No Cart
+        const cartStatus = (incomingItems && incomingItems.length > 0) ? "Active Cart" : "No Cart";
         const event = {
           customerProperties: body.customerProperties || {},
-          productProperties: { productName: loginPage },
-          cartProperties: body.cartProperties || {}
+          productProperties: { productName: body?.customerProperties?.lastVisitedPage || "" },
+          cartProperties: Object.assign({}, body.cartProperties, { cartStatus })
         };
         const res = await sendCartToHubSpot(event, masterdata, { includeCartItems: false, eventLabel: "Login", forceNote: true });
         console.debug("[CartEvents] sendCartToHubSpot(login) result:", res);
         result.ok(true);
       } catch (e) {
         console.error(" [CartEvents] Error sending login event to HubSpot:", e);
+        result.ok(false);
+      }
+      ctx.status = 200;
+      ctx.body = result.data;
+      return;
+    }
+
+    // 1b) Logout event
+    if (isLogoutEvent(body)) {
+      console.log(" [CartEvents] Detected logout event for", email);
+      try {
+        // On logout: if cart has items -> Abandoned Cart; if no items -> No Cart
+        const cartStatus = (incomingItems && incomingItems.length > 0) ? "Abandoned Cart" : "No Cart";
+        const event = {
+          customerProperties: body.customerProperties || {},
+          productProperties: { productName: body?.customerProperties?.lastVisitedPage || "" },
+          cartProperties: Object.assign({}, body.cartProperties, { cartStatus })
+        };
+        const res = await sendCartToHubSpot(event, masterdata, { includeCartItems: false, eventLabel: "Logout", forceNote: true });
+        console.debug("[CartEvents] sendCartToHubSpot(logout) result:", res);
+        result.ok(true);
+      } catch (e) {
+        console.error(" [CartEvents] Error sending logout event to HubSpot:", e);
         result.ok(false);
       }
       ctx.status = 200;

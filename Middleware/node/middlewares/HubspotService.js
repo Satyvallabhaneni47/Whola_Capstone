@@ -145,7 +145,7 @@ async function ensureContactByEmail(email) {
   return contactId;
 }
 
-// Update contact properties (skip unknown props)
+// Update contact properties (skip unknown or empty props)
 async function updateContactPropertiesV3(contactId, propertiesObj) {
   if (!contactId) {
     console.warn("[HubSpot] updateContactPropertiesV3 missing contactId");
@@ -154,9 +154,22 @@ async function updateContactPropertiesV3(contactId, propertiesObj) {
   const http = getHttp();
   const url = `${constants.HUBSPOT_UPDATE_CONTACT_URL}${contactId}`;
   const payload = { properties: {} };
+
+  // Only include non-empty values in the payload to avoid overwriting existing HubSpot properties with empty strings.
   for (const k of Object.keys(propertiesObj || {})) {
-    payload.properties[k] = propertiesObj[k] === undefined || propertiesObj[k] === null ? "" : String(propertiesObj[k]);
+    const val = propertiesObj[k];
+    if (val === undefined || val === null) continue;
+    const str = String(val).trim();
+    if (str === "") continue; // skip empty strings
+    payload.properties[k] = str;
   }
+
+  // If nothing to update, return early
+  if (Object.keys(payload.properties).length === 0) {
+    console.debug("[HubSpot] updateContactPropertiesV3: nothing to update (all values empty or null)");
+    return { ok: true, skipped: true };
+  }
+
   try {
     console.debug("[HubSpot] updateContactPropertiesV3 request:", url, JSON.stringify(payload));
     const res = await http.patch(url, payload);
@@ -217,12 +230,11 @@ async function addTimelineNoteV1(contactId, items, eventLabel = "Cart Updated", 
   // Compose note parts
   const noteParts = [];
 
-  // Only treat as a login note when the eventLabel explicitly indicates Login.
-  // This prevents product view payloads that include productProperties from being misclassified as login notes.
-  if (!includeCartItems && eventLabel === "Login") {
-    // Format login note exactly as requested
+  // Treat Login and Logout explicitly
+  if (!includeCartItems && (eventLabel === "Login" || eventLabel === "Logout")) {
     const pageText = productProperties?.productName || productProperties?.name || productProperties?.brandName || "Home";
-    noteParts.push(`🛍️ Customer Logged-in: ${pageText}`);
+    const verb = eventLabel === "Login" ? "Logged-in" : "Logged-out";
+    noteParts.push(`🛍️ Customer ${verb}: ${pageText}`);
   } else if (includeCartItems) {
     if (actionType === "removed") {
       const removedItems = Array.isArray(items) ? items : [];
@@ -299,6 +311,17 @@ async function addTimelineNoteV1(contactId, items, eventLabel = "Cart Updated", 
     console.warn("[HubSpot] addTimelineNoteV1 failed", err?.response?.data || err?.message || err);
     return { ok: false, error: err?.response?.data || err?.message || err };
   }
+}
+
+// Normalize cart status values to canonical set
+function normalizeCartStatus(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim().toLowerCase();
+  if (s.includes("abandon")) return "Abandoned Cart";
+  if (s.includes("active")) return "Active Cart";
+  if (s.includes("no") || s.includes("none") || s.includes("empty")) return "No Cart";
+  // fallback: capitalize words
+  return raw.split(/\s+/).map(w => w[0]?.toUpperCase() + w.slice(1)).join(" ");
 }
 
 // -----------------------------
@@ -384,21 +407,81 @@ async function sendCartToHubSpot(event, masterdata, options = {}) {
       }
     }
 
-    // Build cleaned contact properties (only the fields you want in HubSpot)
-    const contactProps = {
+    // -----------------------------
+    // Decide whether to update last_* contact properties
+    // -----------------------------
+    // Determine if this event should be considered a product view for updating last_* fields.
+    const rawLastActivity = (event.customerProperties?.lastActivityType || "").toString().toLowerCase();
+    const isProductViewEvent = rawLastActivity.includes("product view")
+      || rawLastActivity.includes("product_view")
+      || (options && options.eventLabel === "Product Viewed")
+      || (options && options.forceNote && !!(event.productProperties && event.productProperties.productName));
+
+    // Grab product/brand/category from payload (trimmed)
+    const rawProductName = (event.productProperties?.productName || "").toString().trim();
+    const rawBrandName = (event.productProperties?.brandName || "").toString().trim();
+    const rawCategoryName = (event.productProperties?.categoryName || "").toString().trim();
+
+    // Optional: list of weak fallbacks to ignore (site name, placeholders)
+    const WEAK_FALLBACKS = new Set(["whola", "home", "homepage", "site", "default"]);
+
+    // Helper: meaningful value check
+    function isMeaningful(val) {
+      if (!val) return false;
+      const lower = val.toLowerCase();
+      if (WEAK_FALLBACKS.has(lower)) return false;
+      // skip single-character or obviously invalid values
+      if (lower.length <= 1) return false;
+      // skip values that are just numbers or placeholders like "product"
+      if (/^\d+$/.test(lower)) return false;
+      if (lower === "product" || lower === "item") return false;
+      return true;
+    }
+
+    // Build cleaned contact properties but only set last_* when this is a product view and values are meaningful
+    const contactPropsRaw = {
       email: email,
       last_activity_type: event.customerProperties?.lastActivityType || "Product view",
-      last_product_viewed: event.productProperties?.productName || "",
-      last_brand_viewed: event.productProperties?.brandName || "",
-      last_category_viewed: event.productProperties?.categoryName || "",
-      cart_status: event.cartProperties?.cartStatus || "",
+      last_product_viewed: null,
+      last_brand_viewed: null,
+      last_category_viewed: null,
+      cart_status: normalizeCartStatus(event.cartProperties?.cartStatus || ""),
       customer_type: computedCustomerType,
     };
+
+    // Only set last_* if this is a product view (or forced product note) AND the values are meaningful
+    if (isProductViewEvent) {
+      if (isMeaningful(rawProductName)) contactPropsRaw.last_product_viewed = rawProductName;
+      if (isMeaningful(rawBrandName)) contactPropsRaw.last_brand_viewed = rawBrandName;
+      if (isMeaningful(rawCategoryName)) contactPropsRaw.last_category_viewed = rawCategoryName;
+    } else {
+      // Not a product view: do not set last_* fields (preserve existing HubSpot values)
+      console.debug("[HubSpot] Event is not a product view; skipping last_* property assignment");
+    }
+
+    // Filter out empty/null values so we don't overwrite existing HubSpot properties with blanks
+    const contactProps = {};
+    for (const k of Object.keys(contactPropsRaw)) {
+      const v = contactPropsRaw[k];
+      if (v === undefined || v === null) continue;
+      const s = String(v).trim();
+      if (s === "") continue;
+      contactProps[k] = s;
+    }
+
+    if (Object.keys(contactProps).length === 0) {
+      console.debug("[HubSpot] No non-empty contact properties to upsert; contact update will be skipped");
+    } else {
+      console.debug("[HubSpot] Contact properties to upsert:", contactProps);
+    }
 
     // Upsert contact properties
     try {
       if (!contactId) {
-        const createRes = await createContactV3(contactProps);
+        // create contact with only non-empty props (if any)
+        const createProps = { email };
+        Object.assign(createProps, contactProps);
+        const createRes = await createContactV3(createProps);
         if (createRes.ok) {
           contactId = createRes.id;
           console.log("[HubSpot] Created new contact id:", contactId);
@@ -406,9 +489,11 @@ async function sendCartToHubSpot(event, masterdata, options = {}) {
           console.warn("[HubSpot] createContactV3 failed, continuing to note creation if possible", createRes.error);
         }
       } else {
+        // update only non-empty props; updateContactPropertiesV3 will skip if nothing to update
         const updateRes = await updateContactPropertiesV3(contactId, contactProps);
         if (updateRes.ok) {
-          console.log("[HubSpot] Updated contact id:", contactId);
+          if (updateRes.skipped) console.debug("[HubSpot] updateContactPropertiesV3 skipped (no non-empty props)");
+          else console.log("[HubSpot] Updated contact id:", contactId);
         } else {
           console.warn("[HubSpot] updateContactPropertiesV3 failed", updateRes.error);
         }

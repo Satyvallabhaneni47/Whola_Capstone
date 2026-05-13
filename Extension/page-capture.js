@@ -1,17 +1,17 @@
 // page-capture.js
-// Only forward when product or cart actually changes (dedupe at source).
-// Place at the root of your extension and inject into the page main world.
+// Capture layer with login/logout detection and cart-status logic.
+// Injected into page MAIN world.
 
 (function () {
   const MIDDLEWARE_URL = window.__MIDDLEWARE_URL__ || null;
   const LAST_SENT_KEY = "__WHOLA_LAST_SENT__";
+  const LAST_KNOWN_EMAIL_KEY = "__WHOLA_LAST_KNOWN_EMAIL__";
 
   // --- Utilities ---
   function safeStringify(obj) {
     try {
       return JSON.stringify(obj);
     } catch (e) {
-      // fallback for circular refs
       const cache = new WeakSet();
       return JSON.stringify(obj, (k, v) => {
         if (typeof v === "object" && v !== null) {
@@ -23,7 +23,6 @@
     }
   }
 
-  // Simple stable hash (FNV-like) for small payloads
   function simpleHash(str) {
     let h = 2166136261 >>> 0;
     for (let i = 0; i < str.length; i++) {
@@ -33,7 +32,7 @@
     return h.toString(16);
   }
 
-  // --- Data extraction (same as before, minimal) ---
+  // --- Data extraction helpers (minimal, robust) ---
   async function getCartStatusAndItems() {
     try {
       const res = await fetch('/api/checkout/pub/orderForm', { credentials: 'include' });
@@ -87,7 +86,7 @@
     }
   }
 
-  // --- Forwarding bridge (same as before) ---
+  // --- Forwarding bridge to extension background (via window events) ---
   function forwardToExtension(payload) {
     try {
       const ev = new CustomEvent('WHOLA_SEND_TO_MW', { detail: payload });
@@ -97,16 +96,90 @@
     }
   }
 
-  // --- Core: capture snapshot, compute hash, forward only on change ---
+  // --- Core: build payload and forward ---
+  function buildPayload({ email, vtexCustomerId, sessionId, lastActivityType, product, cart }) {
+    return {
+      customerProperties: {
+        email: email || null,
+        vtexCustomerId: vtexCustomerId || null,
+        sessionId: sessionId || null,
+        lastActivityType: lastActivityType || 'Product view'
+      },
+      productProperties: {
+        productName: product.productName || '',
+        brandName: product.brandName || '',
+        categoryName: product.categoryName || '',
+        productId: product.productId || ''
+      },
+      cartProperties: {
+        cartStatus: cart.cartStatus || '',
+        items: cart.items || []
+      }
+    };
+  }
+
+  // --- Login / Logout detection and forced send logic ---
   async function captureAndForwardIfChanged() {
     const session = await getSessionEmailAndIds();
     const fallbackEmail = localStorage.getItem('whola_email') || null;
     const email = session.email || fallbackEmail;
+    const vtexCustomerId = session.id || null;
+    const sessionId = session.sessionId || null;
 
     const product = getProductFromJsonLd() || { productName: document.title || '', brandName: '', categoryName: '', productId: '' };
     const cart = await getCartStatusAndItems();
 
-    // Build the snapshot that matters for HubSpot notes (product + cart)
+    // Detect login/logout by comparing with last known email stored in sessionStorage
+    let lastKnownEmail = null;
+    try {
+      lastKnownEmail = sessionStorage.getItem(LAST_KNOWN_EMAIL_KEY) || null;
+    } catch (e) {
+      lastKnownEmail = null;
+    }
+
+    // Normalize cart status string for decision-making
+    const hasItems = Array.isArray(cart.items) && cart.items.length > 0;
+
+    // If email appeared (login)
+    if (!lastKnownEmail && email) {
+      // Login detected
+      const cartStatus = hasItems ? 'Active Cart' : 'No Cart';
+      const payload = buildPayload({
+        email,
+        vtexCustomerId,
+        sessionId,
+        lastActivityType: 'Login',
+        product,
+        cart: { cartStatus, items: cart.items || [] }
+      });
+      forwardToExtension(payload);
+      // update last-known email
+      try { sessionStorage.setItem(LAST_KNOWN_EMAIL_KEY, email); } catch (e) {}
+      // Also persist last-sent hash so dedupe doesn't block immediate subsequent snapshots
+      try { localStorage.setItem(LAST_SENT_KEY, simpleHash(safeStringify({ type: 'login', email, cartStatus }))); } catch (e) {}
+      return;
+    }
+
+    // If email disappeared (logout)
+    if (lastKnownEmail && !email) {
+      // Logout detected
+      const cartStatus = hasItems ? 'Abandoned Cart' : 'No Cart';
+      const payload = buildPayload({
+        email: lastKnownEmail, // use last known email to associate note
+        vtexCustomerId,
+        sessionId,
+        lastActivityType: 'Logout',
+        product,
+        cart: { cartStatus, items: cart.items || [] }
+      });
+      forwardToExtension(payload);
+      // clear last-known email
+      try { sessionStorage.removeItem(LAST_KNOWN_EMAIL_KEY); } catch (e) {}
+      try { localStorage.setItem(LAST_SENT_KEY, simpleHash(safeStringify({ type: 'logout', email: lastKnownEmail, cartStatus }))); } catch (e) {}
+      return;
+    }
+
+    // No login/logout transition — proceed with normal snapshot dedupe for product/cart
     const snapshot = {
       email: email || null,
       product: {
@@ -128,39 +201,85 @@
 
     // If unchanged, do nothing
     if (last === hash) {
-      // console.debug('[WholaCapture] snapshot unchanged — skipping forward');
       return;
     }
 
-    // Build payload (same shape your middleware expects)
-    const payload = {
-      customerProperties: {
-        email: email,
-        vtexCustomerId: session.id || null,
-        sessionId: session.sessionId || null,
-        lastActivityType: 'Product view'
-      },
-      productProperties: {
-        productName: product.productName || '',
-        brandName: product.brandName || '',
-        categoryName: product.categoryName || '',
-        productId: product.productId || ''
-      },
-      cartProperties: {
-        cartStatus: cart.cartStatus,
-        items: cart.items || []
-      }
-    };
+    // Build payload (product view by default)
+    const payload = buildPayload({
+      email,
+      vtexCustomerId,
+      sessionId,
+      lastActivityType: 'Product view',
+      product,
+      cart
+    });
 
-    // Forward to extension background (bridge)
     forwardToExtension(payload);
 
-    // Persist last-sent hash
+    // Persist last-sent hash and last-known email
+    try { localStorage.setItem(LAST_SENT_KEY, hash); } catch (e) {}
     try {
-      localStorage.setItem(LAST_SENT_KEY, hash);
-    } catch (e) {
-      // ignore
+      if (email) sessionStorage.setItem(LAST_KNOWN_EMAIL_KEY, email);
+      else sessionStorage.removeItem(LAST_KNOWN_EMAIL_KEY);
+    } catch (e) {}
+  }
+
+  // --- Public helpers for manual triggers (exposed to page API) ---
+  async function captureLoginManual() {
+    const session = await getSessionEmailAndIds();
+    const email = session.email || localStorage.getItem('whola_email') || null;
+    const vtexCustomerId = session.id || null;
+    const sessionId = session.sessionId || null;
+    const cart = await getCartStatusAndItems();
+    const hasItems = Array.isArray(cart.items) && cart.items.length > 0;
+    const cartStatus = hasItems ? 'Active Cart' : 'No Cart';
+    const product = getProductFromJsonLd() || { productName: document.title || '', brandName: '', categoryName: '', productId: '' };
+
+    if (!email) {
+      // nothing to do if no email known
+      return { status: 0, error: 'no-email' };
     }
+
+    const payload = buildPayload({
+      email,
+      vtexCustomerId,
+      sessionId,
+      lastActivityType: 'Login',
+      product,
+      cart: { cartStatus, items: cart.items || [] }
+    });
+
+    forwardToExtension(payload);
+    try { sessionStorage.setItem(LAST_KNOWN_EMAIL_KEY, email); } catch (e) {}
+    return { status: 1 };
+  }
+
+  async function captureLogoutManual() {
+    const session = await getSessionEmailAndIds();
+    const email = sessionStorage.getItem(LAST_KNOWN_EMAIL_KEY) || localStorage.getItem('whola_email') || null;
+    const vtexCustomerId = session.id || null;
+    const sessionId = session.sessionId || null;
+    const cart = await getCartStatusAndItems();
+    const hasItems = Array.isArray(cart.items) && cart.items.length > 0;
+    const cartStatus = hasItems ? 'Abandoned Cart' : 'No Cart';
+    const product = getProductFromJsonLd() || { productName: document.title || '', brandName: '', categoryName: '', productId: '' };
+
+    if (!email) {
+      return { status: 0, error: 'no-email' };
+    }
+
+    const payload = buildPayload({
+      email,
+      vtexCustomerId,
+      sessionId,
+      lastActivityType: 'Logout',
+      product,
+      cart: { cartStatus, items: cart.items || [] }
+    });
+
+    forwardToExtension(payload);
+    try { sessionStorage.removeItem(LAST_KNOWN_EMAIL_KEY); } catch (e) {}
+    return { status: 1 };
   }
 
   // --- Init and periodic checks ---
@@ -168,13 +287,15 @@
     // Run once immediately
     captureAndForwardIfChanged();
 
-    // Run on navigation/interval but less frequently than before
-    // 5s interval is a reasonable compromise; adjust as needed
+    // Periodic check (5s)
     setInterval(captureAndForwardIfChanged, 5000);
 
-    // Also flush buffer when session becomes available (if you implemented buffering)
-    // (left out here for brevity — keep your existing flush logic if present)
+    // Expose manual triggers for debugging/testing
+    try {
+      window.__WHOLA_CAPTURE_LOGIN__ = captureLoginManual;
+      window.__WHOLA_CAPTURE_LOGOUT__ = captureLogoutManual;
+    } catch (e) {}
   })();
 
-  console.log("[WholaCapture] page-capture dedupe enabled");
+  console.log("[WholaCapture] page-capture loaded (login/logout detection enabled)");
 })();
