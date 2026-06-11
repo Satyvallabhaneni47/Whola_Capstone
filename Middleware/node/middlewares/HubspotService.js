@@ -44,7 +44,7 @@ function getHttp() {
 }
 
 // -----------------------------
-// Masterdata helpers
+// Masterdata helpers , reads from dedupe table
 // -----------------------------
 async function getLastSeenFromMasterdata(masterdata, email) {
   if (!masterdata || !email) return null;
@@ -60,6 +60,9 @@ async function getLastSeenFromMasterdata(masterdata, email) {
     return null;
   }
 }
+// -----------------------------
+//write/update dedupe table
+// -----------------------------
 
 async function upsertLastSeenToMasterdata(masterdata, email, eventName, tsIso) {
   if (!masterdata || !email) return false;
